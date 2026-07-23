@@ -1,80 +1,146 @@
 name: Security Pipeline
 
 on:
+  push:
+    branches:
+      - "feature/**"
+
   pull_request:
     branches:
       - main
 
-  push:
-    branches:
-      - main
-      - feature/**
-      
+  workflow_dispatch:
+
+# Least-privilege permission for the entire workflow.
+permissions:
+  contents: read
+
+# Cancel older runs when a developer pushes a newer commit
+# to the same branch or Pull Request.
+concurrency:
+  group: security-pipeline-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # Fixed scanner versions approved for this implementation.
+  SEMGREP_VERSION: "1.162.0"
+  TRUFFLEHOG_VERSION: "v3.93.6"
+
+  # The image is identified using the exact Git commit.
+  IMAGE_NAME: devsecops-demo
+  IMAGE_TAG: ${{ github.sha }}
 
 jobs:
-  setup:
-    name: Repository Setup
-    runs-on: ubuntu-latest
 
-    steps:
-      - name: Checkout Repository
-        uses: actions/checkout@v4
-
-      - name: Setup Node.js
-        uses: actions/setup-node@v4
-        with:
-          node-version-file: .nvmrc
-          cache: npm
-
-      - name: Display Node Version
-        run: node -v
-
-      - name: Display npm Version
-        run: npm -v
-
+  # ==========================================================
+  # 1. SEMGREP SAST
+  # Runs on:
+  # - feature branch pushes
+  # - Pull Requests targeting main
+  # - manual runs
+  # ==========================================================
   semgrep:
     name: Semgrep SAST Scan
     runs-on: ubuntu-latest
-    needs: setup
+
+    timeout-minutes: 15
 
     permissions:
       contents: read
-      security-events: write
 
     steps:
       - name: Checkout Repository
         uses: actions/checkout@v4
-
-      - name: Run Semgrep
-        uses: semgrep/semgrep-action@v1
         with:
-          config: p/security-audit
+          persist-credentials: false
 
+      - name: Set Up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install Approved Semgrep Version
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          python -m pip install --upgrade pip
+          python -m pip install "semgrep==${SEMGREP_VERSION}"
+
+      - name: Display Semgrep Version
+        shell: bash
+        run: |
+          set -euo pipefail
+          semgrep --version
+
+      - name: Run Semgrep Security Scan
+        shell: bash
+        env:
+          SEMGREP_SEND_METRICS: "off"
+        run: |
+          set -euo pipefail
+
+          semgrep scan \
+            --config "p/security-audit" \
+            --metrics "off" \
+            --error \
+            --exclude "node_modules" \
+            --exclude ".git" \
+            --exclude ".next" \
+            --exclude "dist" \
+            --exclude "coverage" \
+            .
+
+  # ==========================================================
+  # 2. TRUFFLEHOG SECRET SCANNING
+  # Runs on:
+  # - feature branch pushes
+  # - Pull Requests targeting main
+  # - manual runs
+  # ==========================================================
   trufflehog:
     name: TruffleHog Secret Scan
     runs-on: ubuntu-latest
 
-    needs: setup
+    timeout-minutes: 15
 
     permissions:
       contents: read
 
     steps:
-      - name: Checkout Repository
+      - name: Checkout Repository with Full Git History
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
+          persist-credentials: false
 
-      - name: Run TruffleHog
-        uses: trufflesecurity/trufflehog@main
+      - name: Run TruffleHog Secret Scan
+        uses: trufflesecurity/trufflehog@v3.93.6
         with:
           path: ./
-          base: ""
-          head: HEAD
+          version: ${{ env.TRUFFLEHOG_VERSION }}
 
+          # Prevent TruffleHog from contacting external providers
+          # to verify whether discovered credentials are active.
+          #
+          # The action itself already adds:
+          # --fail
+          # --no-update
+          # --github-actions
+          extra_args: --no-verification
+
+  # ==========================================================
+  # 3. DOCKER BUILD
+  # Runs only for Pull Requests targeting main.
+  #
+  # It waits until Semgrep and TruffleHog pass.
+  # ==========================================================
   docker-build:
     name: Docker Build
+    if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
+
+    timeout-minutes: 20
 
     needs:
       - semgrep
@@ -86,22 +152,72 @@ jobs:
     steps:
       - name: Checkout Repository
         uses: actions/checkout@v4
+        with:
+          persist-credentials: false
 
-      - name: Set up Docker Buildx
+      - name: Set Up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
       - name: Build Docker Image
         uses: docker/build-push-action@v6
         with:
           context: .
-          push: false
-          load: true
-          tags: plantu-ai:latest
+          file: ./Dockerfile
 
+          # Do not send the image to any registry.
+          push: false
+
+          # Load the image into the runner's local Docker engine
+          # so that it can be saved and scanned.
+          load: true
+
+          tags: ${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }}
+
+          # Add traceable metadata to the image.
+          labels: |
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+
+      - name: Verify Docker Image
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          docker image inspect \
+            "${IMAGE_NAME}:${IMAGE_TAG}"
+
+      - name: Save Built Docker Image
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          docker save \
+            "${IMAGE_NAME}:${IMAGE_TAG}" \
+            --output devsecops-demo-image.tar
+
+      - name: Upload Docker Image for Trivy
+        uses: actions/upload-artifact@v4
+        with:
+          name: docker-image-${{ github.sha }}
+          path: devsecops-demo-image.tar
+
+          # The image is only needed by the next job.
+          retention-days: 1
+
+          if-no-files-found: error
+
+  # ==========================================================
+  # 4. TRIVY CONTAINER IMAGE SCANNING
+  # Runs only for Pull Requests targeting main.
+  #
+  # It scans the exact image created by the Docker Build job.
+  # ==========================================================
   trivy:
     name: Trivy Image Scan
-
+    if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
+
+    timeout-minutes: 20
 
     needs:
       - docker-build
@@ -109,27 +225,56 @@ jobs:
     permissions:
       contents: read
 
+    env:
+      # Disable Trivy telemetry and version-notification checks.
+      TRIVY_DISABLE_TELEMETRY: "true"
+      TRIVY_SKIP_VERSION_CHECK: "true"
+
     steps:
-      - name: Checkout Repository
-        uses: actions/checkout@v4
-
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
-
-      - name: Build Docker Image
-        uses: docker/build-push-action@v6
+      - name: Download Built Docker Image
+        uses: actions/download-artifact@v4
         with:
-          context: .
-          load: true
-          push: false
-          tags: plantu-ai:latest
+          name: docker-image-${{ github.sha }}
+          path: .
 
-      - name: Run Trivy Image Scan
+      - name: Load Docker Image
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          docker load \
+            --input devsecops-demo-image.tar
+
+      - name: Verify Loaded Docker Image
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          docker image inspect \
+            "${IMAGE_NAME}:${IMAGE_TAG}"
+
+      - name: Run Trivy HIGH and CRITICAL Security Gate
         uses: aquasecurity/trivy-action@v0.36.0
+        env:
+          TRIVY_DISABLE_TELEMETRY: "true"
+          TRIVY_SKIP_VERSION_CHECK: "true"
         with:
-          image-ref: plantu-ai:latest
+          scan-type: image
+          image-ref: ${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }}
+
           format: table
-          exit-code: 0
+
+          # Fail the job when matching vulnerabilities are found.
+          exit-code: "1"
+
+          severity: HIGH,CRITICAL
+
+          # Do not block the PR for vulnerabilities where
+          # the vendor currently provides no fix.
           ignore-unfixed: true
+
+          # Scan operating-system and application dependencies.
           vuln-type: os,library
-          severity: CRITICAL,HIGH
+
+          # Vulnerability scanning only.
+          scanners: vuln
