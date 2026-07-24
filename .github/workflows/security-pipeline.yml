@@ -24,7 +24,7 @@ concurrency:
 env:
   # Fixed scanner versions approved for this implementation.
   SEMGREP_VERSION: "1.162.0"
-  TRUFFLEHOG_VERSION: "v3.93.6"
+  TRUFFLEHOG_VERSION: "3.93.6"
 
   # The image is identified using the exact Git commit.
   IMAGE_NAME: devsecops-demo
